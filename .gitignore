@@ -1,0 +1,15 @@
+# Entorno virtual: se crea de nuevo con python -m venv .venv
+.venv/
+venv/
+env/
+
+# Python generado localmente
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Configuración local de editores y del sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
