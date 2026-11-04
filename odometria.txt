@@ -1,0 +1,403 @@
+"""Teleoperación del Roomba 650 con odometría, sensores de colisión e interfaz mejorada.
+
+Requiere matplotlib:  pip install matplotlib
+Ejecución:           py odometria.py --port COM8
+"""
+
+import argparse
+import math
+import re
+
+import serial
+
+from main import Roomba
+
+DISTANCIA_RUEDAS_MM = 235.0  # Ancho de vía del Roomba
+ANGULO_EN_GRADOS = True      # El paquete OI 20 del Roomba 600 devuelve grados
+ESCALA_GIRO = 1.0            # Factor de calibración de giro
+VEL_RECTO = 150              # mm/s
+VEL_GIRO = 100               # mm/s por rueda
+PERIODO_MS = 100             # Refresco de sensores y gráfico en ms
+REVERSE_ROUTE = {"F": "B", "B": "F", "L": "R", "R": "L"}
+
+
+def parse_route(value: str) -> list[tuple[str, float]]:
+    """Parsea rutas como F100,R90,F150 (distancias en cm, giros en grados)."""
+    steps = []
+    for chunk in value.split(","):
+        match = re.fullmatch(r"\s*([FBLR])\s*(\d+(?:\.\d+)?)\s*", chunk, re.IGNORECASE)
+        if not match:
+            raise ValueError(f"Tramo no válido: {chunk!r}. Usa F100, B20, L90 o R90.")
+        command = match.group(1).upper()
+        amount = float(match.group(2))
+        if amount <= 0:
+            raise ValueError("Las distancias y los ángulos deben ser mayores que cero.")
+        if command in "LR" and amount > 360:
+            raise ValueError("El giro debe ser de 360 grados o menos.")
+        if command in "FB" and amount > 500:
+            raise ValueError("Cada tramo recto está limitado a 500 cm.")
+        steps.append((command, amount))
+    if not steps:
+        raise ValueError("Escribe al menos un tramo de ruta.")
+    return steps
+
+
+def read_sensors_and_odometry(robot: Roomba) -> tuple[int, int, int] | None:
+    """Lee Choques/Ruedas (paquete 7), Distancia (19) y Ángulo (20) en un solo envío (149)."""
+    ser = robot.serial
+    ser.reset_input_buffer()
+    ser.write(bytes([149, 3, 7, 19, 20]))
+    ser.flush()
+    data = ser.read(5)
+    if len(data) != 5:
+        return None
+    bumps = data[0]
+    distancia = int.from_bytes(data[1:3], byteorder="big", signed=True)
+    angulo = int.from_bytes(data[3:5], byteorder="big", signed=True)
+    return bumps, distancia, angulo
+
+
+class Odometria:
+    """Integra los incrementos (Distance, Angle) en una posición (x, y, theta)."""
+
+    def __init__(self) -> None:
+        self.reiniciar()
+
+    def reiniciar(self) -> None:
+        self.x = 0.0       # mm
+        self.y = 0.0       # mm
+        self.theta = 0.0   # rad
+        self.camino = [(0.0, 0.0)]
+        self.total_distancia = 0
+        self.total_angulo = 0
+
+    def actualizar(self, distancia: int, angulo: int) -> None:
+        self.total_distancia += distancia
+        self.total_angulo += angulo
+
+        ds = float(distancia)
+        dth = math.radians(angulo) if ANGULO_EN_GRADOS else 2.0 * angulo / DISTANCIA_RUEDAS_MM
+        dth *= ESCALA_GIRO
+
+        if abs(dth) < 1e-6:
+            dx, dy = ds, 0.0
+        else:
+            r = ds / dth
+            dx = r * math.sin(dth)
+            dy = r * 2.0 * math.sin(dth / 2.0) ** 2
+
+        c, s = math.cos(self.theta), math.sin(self.theta)
+        self.x += dx * c - dy * s
+        self.y += dx * s + dy * c
+        self.theta += dth
+        self.camino.append((self.x, self.y))
+
+
+class Teleoperacion:
+    ORDENES = {
+        "up": (VEL_RECTO, VEL_RECTO),
+        "down": (-VEL_RECTO, -VEL_RECTO),
+        "left": (VEL_GIRO, -VEL_GIRO),
+        "right": (-VEL_GIRO, VEL_GIRO),
+    }
+
+    def __init__(self, robot: Roomba) -> None:
+        import matplotlib.pyplot as plt
+
+        for clave in list(plt.rcParams):
+            if clave.startswith("keymap."):
+                plt.rcParams[clave] = []
+
+        self.plt = plt
+        self.robot = robot
+        self.odo = Odometria()
+        self.orden: str | None = None
+        self.fallos = 0
+        self.route_active = False
+        self.route_returning = False
+        self.route_queue: list[tuple[str, float]] = []
+        self.route_current: tuple[str, float] | None = None
+        self.route_progress = 0.0
+        self.route_done: list[tuple[str, float]] = []
+
+        self.fig, self.ax = plt.subplots(figsize=(9, 7))
+        self.fig.subplots_adjust(bottom=0.24)
+        self.ax.set_aspect("equal")
+        self.ax.set_xlabel("x (m)")
+        self.ax.set_ylabel("y (m)")
+        self.ax.set_title("Control y Odometría de Roomba 650 (con seguridad activa)")
+        self.ax.grid(True)
+
+        (self.linea,) = self.ax.plot([0.0], [0.0], "-", color="tab:blue", linewidth=2)
+        (self.punto,) = self.ax.plot([0.0], [0.0], "o", color="tab:red", markersize=8)
+        (self.rumbo,) = self.ax.plot([], [], "-", color="tab:red", linewidth=2)
+
+        # Testigos visuales de los sensores en la interfaz
+        self.txt_bump_izq = self.ax.text(0.02, 0.95, " BUMP IZQ ", transform=self.ax.transAxes,
+                                         fontsize=9, fontweight="bold", color="white",
+                                         bbox=dict(boxstyle="round,pad=0.3", facecolor="gray", edgecolor="none"))
+        self.txt_bump_der = self.ax.text(0.82, 0.95, " BUMP DER ", transform=self.ax.transAxes,
+                                         fontsize=9, fontweight="bold", color="white",
+                                         bbox=dict(boxstyle="round,pad=0.3", facecolor="gray", edgecolor="none"))
+
+        from matplotlib.widgets import Button, TextBox
+
+        route_ax = self.fig.add_axes([0.14, 0.095, 0.40, 0.055])
+        self.route_text = TextBox(route_ax, "Ruta ", initial="F100,R90,F150")
+        run_ax = self.fig.add_axes([0.57, 0.095, 0.16, 0.055])
+        return_ax = self.fig.add_axes([0.75, 0.095, 0.15, 0.055])
+        stop_ax = self.fig.add_axes([0.92, 0.095, 0.07, 0.055])
+
+        self.run_button = Button(run_ax, "Ejecutar")
+        self.return_button = Button(return_ax, "Volver")
+        self.stop_button = Button(stop_ax, "Parar")
+
+        self.run_button.on_clicked(self.ejecutar_ruta)
+        self.return_button.on_clicked(self.volver_ruta)
+        self.stop_button.on_clicked(lambda _event: self.cancelar_ruta("Parada solicitada por usuario."))
+        self.estado = self.fig.text(0.14, 0.035, "Flechas: manual. Espacio/x: parada. Sensores de choque activos.")
+
+        self.fig.canvas.mpl_connect("key_press_event", self.tecla)
+        self.timer = self.fig.canvas.new_timer(interval=PERIODO_MS)
+        self.timer.add_callback(self.tick)
+
+    def tecla(self, evento) -> None:
+        k = evento.key
+        if k in self.ORDENES:
+            if self.route_active:
+                return
+            if self.route_done:
+                self.route_done = []
+            if k == self.orden:
+                return
+            if self.orden is None:
+                bloqueos = self.robot.check_safety_sensors()
+                if bloqueos:
+                    print("No se puede mover; detectado:", ", ".join(bloqueos))
+                    self.estado.set_text(f"Bloqueado: {', '.join(bloqueos)}")
+                    self.fig.canvas.draw_idle()
+                    return
+            self.robot.drive_direct(*self.ORDENES[k])
+            self.orden = k
+        elif k in (" ", "x"):
+            if self.route_active:
+                self.cancelar_ruta("Parada de emergencia.")
+            else:
+                self.parar()
+                self.estado.set_text("Parado.")
+                self.fig.canvas.draw_idle()
+        elif k == "r":
+            self.odo.reiniciar()
+            self.dibujar()
+        elif k == "q":
+            if self.route_active:
+                self.cancelar_ruta("Cerrando programa.")
+            else:
+                self.parar()
+            self.plt.close(self.fig)
+
+    def parar(self) -> None:
+        self.robot.stop()
+        self.orden = None
+
+    def ejecutar_ruta(self, _event=None) -> None:
+        if self.route_active or self.orden is not None:
+            self.estado.set_text("Para el movimiento actual antes de iniciar una ruta.")
+            self.fig.canvas.draw_idle()
+            return
+        try:
+            self.route_queue = parse_route(self.route_text.text)
+        except ValueError as error:
+            self.estado.set_text(str(error))
+            self.fig.canvas.draw_idle()
+            return
+        blocked = self.robot.check_safety_sensors()
+        if blocked:
+            self.estado.set_text(f"Ruta no iniciada: {', '.join(blocked)}.")
+            self.fig.canvas.draw_idle()
+            return
+        self.route_done = []
+        self.route_returning = False
+        self.route_active = True
+        self._siguiente_tramo()
+
+    def volver_ruta(self, _event=None) -> None:
+        if self.route_active or self.orden is not None:
+            self.estado.set_text("Para el movimiento actual antes de regresar.")
+            self.fig.canvas.draw_idle()
+            return
+        if not self.route_done:
+            self.estado.set_text("No hay una ruta completada para regresar.")
+            self.fig.canvas.draw_idle()
+            return
+        blocked = self.robot.check_safety_sensors()
+        if blocked:
+            self.estado.set_text(f"Regreso no iniciado: {', '.join(blocked)}.")
+            self.fig.canvas.draw_idle()
+            return
+        self.route_queue = [(REVERSE_ROUTE[cmd], amount)
+                            for cmd, amount in reversed(self.route_done)]
+        self.route_returning = True
+        self.route_active = True
+        self._siguiente_tramo()
+
+    def _siguiente_tramo(self) -> None:
+        if not self.route_queue:
+            self.robot.stop()
+            self.route_active = False
+            self.route_current = None
+            if self.route_returning:
+                self.estado.set_text("Regreso terminado.")
+                self.route_done = []
+            else:
+                self.estado.set_text("Ruta terminada. Pulsa «Volver» para regresar.")
+            self.fig.canvas.draw_idle()
+            return
+
+        self.route_current = self.route_queue.pop(0)
+        command, amount = self.route_current
+        self.route_progress = 0.0
+        wheels = {
+            "F": (VEL_RECTO, VEL_RECTO),
+            "B": (-VEL_RECTO, -VEL_RECTO),
+            "L": (VEL_GIRO, -VEL_GIRO),
+            "R": (-VEL_GIRO, VEL_GIRO),
+        }[command]
+        self.robot.drive_direct(*wheels)
+        unit = "cm" if command in "FB" else "°"
+        action = {"F": "avanzando", "B": "retrocediendo", "L": "girando izq", "R": "girando der"}[command]
+        self.estado.set_text(f"Ruta: {action} {amount:g} {unit}…")
+        self.fig.canvas.draw_idle()
+
+    def cancelar_ruta(self, message: str) -> None:
+        if self.route_active and not self.route_returning and self.route_current:
+            command, _ = self.route_current
+            done = self.route_progress / 10.0 if command in "FB" else self.route_progress
+            if done > (0.5 if command in "FB" else 1.0):
+                self.route_done.append((command, done))
+        self.route_queue = []
+        self.route_current = None
+        self.route_active = False
+        self.parar()
+        self.estado.set_text(message)
+        self.fig.canvas.draw_idle()
+
+    def _actualizar_ruta(self, distancia: int, angulo: int) -> None:
+        if not self.route_active or self.route_current is None:
+            return
+        command, amount = self.route_current
+        if command == "F":
+            self.route_progress += distancia
+            target = amount * 10.0
+        elif command == "B":
+            self.route_progress -= distancia
+            target = amount * 10.0
+        elif command == "L":
+            self.route_progress += angulo
+            target = amount
+        else:
+            self.route_progress -= angulo
+            target = amount
+
+        unit = "cm" if command in "FB" else "°"
+        current = self.route_progress / 10.0 if command in "FB" else self.route_progress
+        action = {"F": "avanzando", "B": "retrocediendo", "L": "girando izq", "R": "girando der"}[command]
+        self.estado.set_text(f"Ruta: {action} {max(0.0, current):.1f}/{amount:g} {unit}")
+        if self.route_progress >= target:
+            self.robot.stop()
+            if not self.route_returning:
+                actual = self.route_progress / 10.0 if command in "FB" else self.route_progress
+                self.route_done.append((command, actual))
+            self.route_current = None
+            self._siguiente_tramo()
+        self.fig.canvas.draw_idle()
+
+    def tick(self) -> None:
+        lectura = read_sensors_and_odometry(self.robot)
+        if lectura is None:
+            self.fallos += 1
+            if self.fallos == 5:
+                if self.route_active:
+                    self.cancelar_ruta("Conexión perdida con el Roomba.")
+                else:
+                    self.parar()
+            return
+        self.fallos = 0
+        bumps, distancia, angulo = lectura
+
+        # 1. Comprobar Choques / Sensores
+        bump_right = bool(bumps & 0b00000001)
+        bump_left = bool(bumps & 0b00000002)
+        wheel_drop = bool(bumps & 0b00011100)
+
+        # Actualizar colores de los testigos visuales
+        self.txt_bump_izq.get_bbox_patch().set_facecolor("red" if bump_left else "gray")
+        self.txt_bump_der.get_bbox_patch().set_facecolor("red" if bump_right else "gray")
+
+        # Freno automático si hay movimiento activo (manual o ruta)
+        if (bump_left or bump_right or wheel_drop) and (self.orden is not None or self.route_active):
+            detalles = []
+            if bump_left: detalles.append("choque izquierdo")
+            if bump_right: detalles.append("choque derecho")
+            if wheel_drop: detalles.append("rueda levantada")
+            msg = f"¡PARADA AUTOMÁTICA! Detectado: {', '.join(detalles)}"
+
+            if self.route_active:
+                self.cancelar_ruta(msg)
+            else:
+                self.parar()
+                self.estado.set_text(msg)
+
+        # 2. Actualizar Odometría en mapa
+        if (distancia, angulo) != (0, 0):
+            self.odo.actualizar(distancia, angulo)
+            self.dibujar()
+
+        # 3. Control de Ruta
+        if self.route_active:
+            self._actualizar_ruta(distancia, angulo)
+
+    def dibujar(self) -> None:
+        xs = [p[0] / 1000.0 for p in self.odo.camino]
+        ys = [p[1] / 1000.0 for p in self.odo.camino]
+        self.linea.set_data(xs, ys)
+        self.punto.set_data([xs[-1]], [ys[-1]])
+        largo = 0.15
+        self.rumbo.set_data([xs[-1], xs[-1] + largo * math.cos(self.odo.theta)],
+                            [ys[-1], ys[-1] + largo * math.sin(self.odo.theta)])
+        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        medio = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) / 2 * 1.2
+        self.ax.set_xlim(cx - medio, cx + medio)
+        self.ax.set_ylim(cy - medio, cy + medio)
+        self.fig.canvas.draw_idle()
+
+    def ejecutar(self) -> None:
+        self.dibujar()
+        self.timer.start()
+        self.plt.show()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Teleoperación de Roomba con sensores")
+    parser.add_argument("--port", default="COM8")
+    parser.add_argument("--baud", type=int, default=115200)
+    args = parser.parse_args()
+
+    try:
+        robot = Roomba(args.port, args.baud)
+    except serial.SerialException as error:
+        print(f"No se pudo abrir {args.port}: {error}")
+        return
+    try:
+        if robot.bump_sensors() is None:
+            print("El Roomba no responde. Comprueba encendido y baudios.")
+            return
+        read_sensors_and_odometry(robot)
+        print("Control con flechas. Espacio/x para parar. Sensores de choque activos.")
+        Teleoperacion(robot).ejecutar()
+    finally:
+        robot.close()
+
+
+if __name__ == "__main__":
+    main()

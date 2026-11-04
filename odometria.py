@@ -143,31 +143,46 @@ class Teleoperacion:
         self.route_done: list[tuple[str, float]] = []
         self.route_text = None
 
-        self.fig, self.ax = plt.subplots(figsize=(9, 7))
-        self.fig.subplots_adjust(bottom=0.24)
+        self.fig, self.ax = plt.subplots(figsize=(10, 8))
+        self.fig.subplots_adjust(left=0.10, right=0.97, top=0.91, bottom=0.32)
+        self.fig.patch.set_facecolor("#f4f6f8")
+        self.ax.set_facecolor("#ffffff")
         self.ax.set_aspect("equal")
         self.ax.set_xlabel("x (m)")
         self.ax.set_ylabel("y (m)")
-        self.ax.set_title("Odometría y rutas del Roomba 650")
-        self.ax.grid(True)
-        (self.linea,) = self.ax.plot([0.0], [0.0], "-", color="tab:blue")
-        (self.punto,) = self.ax.plot([0.0], [0.0], "o", color="tab:red")
-        (self.rumbo,) = self.ax.plot([], [], "-", color="tab:red")
+        self.ax.set_title("Mapa en tiempo real", loc="left", fontsize=14, fontweight="bold", pad=14)
+        self.ax.grid(True, color="#e5e9ef")
+        (self.linea,) = self.ax.plot([0.0], [0.0], "-", color="#3977c3", linewidth=2)
+        (self.punto,) = self.ax.plot([0.0], [0.0], "o", color="#e45b52", markersize=9)
+        (self.rumbo,) = self.ax.plot([], [], "-", color="#e45b52", linewidth=2)
 
         from matplotlib.widgets import Button, TextBox
 
-        route_ax = self.fig.add_axes([0.14, 0.095, 0.40, 0.055])
-        self.route_text = TextBox(route_ax, "Ruta ", initial="F100,R90,F150")
-        run_ax = self.fig.add_axes([0.57, 0.095, 0.16, 0.055])
-        return_ax = self.fig.add_axes([0.75, 0.095, 0.15, 0.055])
-        stop_ax = self.fig.add_axes([0.92, 0.095, 0.07, 0.055])
+        route_ax = self.fig.add_axes([0.11, 0.13, 0.38, 0.06])
+        self.route_text = TextBox(route_ax, "Ruta (cm/grados) ", initial="F100,R90,F150")
+        run_ax = self.fig.add_axes([0.53, 0.13, 0.14, 0.06])
+        return_ax = self.fig.add_axes([0.69, 0.13, 0.12, 0.06])
+        stop_ax = self.fig.add_axes([0.84, 0.13, 0.13, 0.06])
         self.run_button = Button(run_ax, "Ejecutar")
         self.return_button = Button(return_ax, "Volver")
         self.stop_button = Button(stop_ax, "Parar")
+        self.stop_button.color = "#f8dedb"
+        self.stop_button.hovercolor = "#f1bdb7"
         self.run_button.on_clicked(self.ejecutar_ruta)
         self.return_button.on_clicked(self.volver_ruta)
         self.stop_button.on_clicked(lambda _event: self.cancelar_ruta("Parada solicitada."))
-        self.estado = self.fig.text(0.14, 0.035, "F/B: cm; L/R: grados. Flechas: teleoperación. Espacio: parada.")
+        self.estado = self.fig.text(
+            0.11, 0.245, "Listo. Usa las flechas para conducir o introduce una ruta.",
+            fontsize=10, color="#263445",
+        )
+        self.sensor_estado = self.fig.text(
+            0.11, 0.205, "Sensores: comprobando…", fontsize=10, color="#8a6500",
+        )
+        self.fig.text(
+            0.11, 0.045,
+            "F/B: cm · L/R: grados     Flechas: conducir     Espacio o X: parar     R: reiniciar mapa     Q: salir",
+            fontsize=9, color="#5b6673",
+        )
 
         self.fig.canvas.mpl_connect("key_press_event", self.tecla)
         self.timer = self.fig.canvas.new_timer(interval=PERIODO_MS)
@@ -193,6 +208,12 @@ class Teleoperacion:
                     return
             self.robot.drive_direct(*self.ORDENES[k])
             self.orden = k
+            action = {
+                "up": "avanzando", "down": "retrocediendo",
+                "left": "girando a la izquierda", "right": "girando a la derecha",
+            }[k]
+            self.estado.set_text(f"Control manual: {action}. Pulsa espacio o X para parar.")
+            self.fig.canvas.draw_idle()
         elif k in (" ", "x"):
             self.cancelar_ruta("Parada de emergencia solicitada.")
         elif k == "r":
@@ -331,6 +352,30 @@ class Teleoperacion:
 
     # --- odometría y dibujo --------------------------------------------------------
     def tick(self) -> None:
+        en_movimiento = self.route_active or self.orden is not None
+        sensores = self.robot.read_safety_sensors()
+        if sensores is None:
+            self.sensor_estado.set_text(
+                f"Sensores: sin respuesta (paquete {self.robot.last_failed_packet}).",
+            )
+            self.sensor_estado.set_color("#b42318")
+            if en_movimiento:
+                self.cancelar_ruta("Movimiento detenido: se perdió la comunicación con los sensores.")
+                return
+        else:
+            self.sensor_estado.set_text(
+                "Sensores: despejados" if not sensores else "Atención: " + ", ".join(sensores),
+            )
+            self.sensor_estado.set_color("#237a4b" if not sensores else "#b42318")
+            if en_movimiento and sensores:
+                if any(sensor.startswith("parachoques") for sensor in sensores):
+                    reason = "contacto con un obstáculo"
+                else:
+                    reason = "condición de seguridad: " + ", ".join(sensores)
+                self.cancelar_ruta(f"Movimiento detenido por {reason}.")
+                return
+        self.fig.canvas.draw_idle()
+
         lectura = read_odometry(self.robot)
         if lectura is None:
             self.fallos += 1
@@ -346,17 +391,6 @@ class Teleoperacion:
             self.odo.actualizar(*lectura)
             self.dibujar()
         if self.route_active:
-            bump = self.robot.read_packet(7)
-            if bump is None:
-                self.cancelar_ruta("Ruta detenida: no responden los sensores de golpe.")
-                return
-            if bump[0] & 0b00000011:
-                self.cancelar_ruta("Ruta detenida por contacto con un obstáculo.")
-                return
-            mode = self.robot.read_packet(35)
-            if mode is None or mode[0] != 2:
-                self.cancelar_ruta("Ruta detenida: Safe mode dejó de estar activo.")
-                return
             self._actualizar_ruta(*lectura)
 
     def dibujar(self) -> None:

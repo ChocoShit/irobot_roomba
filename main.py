@@ -21,7 +21,7 @@ class Roomba:
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=1,
+            timeout=0.2,
             write_timeout=2,
             xonxoff=False,
             rtscts=False,
@@ -61,40 +61,48 @@ class Roomba:
         data = self.read_packet(7)
         return data[0] if data else None
 
-    def check_safety_sensors(self) -> list[str] | None:
-        # Safe mode rechaza movimiento si hay rueda levantada o detecta un desnivel.
-        # Reintentar Safe: una parada por protección devuelve el OI a Passive (modo 1).
-        self.serial.write(bytes([131]))
+    def read_safety_sensors(self) -> list[str] | None:
+        # Query List (149) lee todos los sensores de seguridad en una sola respuesta.
+        packet_ids = (7, 9, 10, 11, 12, 34, 35)
+        self.serial.reset_input_buffer()
+        self.serial.write(bytes([149, len(packet_ids), *packet_ids]))
         self.serial.flush()
-        time.sleep(0.05)
-        bumps_data = self.read_packet(7)
-        if bumps_data is None:
+        data = self.serial.read(len(packet_ids))
+        if len(data) != len(packet_ids):
+            self.last_failed_packet = 149
             return None
-        bumps = bumps_data[0]
+        self.last_failed_packet = None
+
+        bumps = data[0]
         blocked = []
+        if bumps & 0b00000001:
+            blocked.append("parachoques derecho")
+        if bumps & 0b00000010:
+            blocked.append("parachoques izquierdo")
         if bumps & 0b00000100:
             blocked.append("rueda derecha levantada")
         if bumps & 0b00001000:
             blocked.append("rueda izquierda levantada")
         if bumps & 0b00010000:
             blocked.append("rueda delantera levantada")
-        cliff_names = [(9, "desnivel izquierdo"), (10, "desnivel frontal izquierdo"),
-                       (11, "desnivel frontal derecho"), (12, "desnivel derecho")]
-        for packet_id, name in cliff_names:
-            state_data = self.read_packet(packet_id)
-            if state_data is None:
-                return None
-            if state_data[0]:
+        for value, name in zip(data[1:5], (
+            "desnivel izquierdo", "desnivel frontal izquierdo",
+            "desnivel frontal derecho", "desnivel derecho",
+        )):
+            if value:
                 blocked.append(name)
-        charger = self.read_packet(34)
-        mode = self.read_packet(35)
-        if charger is None or mode is None:
-            return None
-        if charger[0] != 0:
+        if data[5] != 0:
             blocked.append("cargador/base conectado")
-        if mode[0] != 2:
-            blocked.append(f"OI no está en modo seguro (modo {mode[0]})")
+        if data[6] != 2:
+            blocked.append(f"OI no está en modo seguro (modo {data[6]})")
         return blocked
+
+    def check_safety_sensors(self) -> list[str] | None:
+        # Reintentar Safe: una parada por protección puede devolver el OI a Passive.
+        self.serial.write(bytes([131]))
+        self.serial.flush()
+        time.sleep(0.05)
+        return self.read_safety_sensors()
 
     def close(self) -> None:
         try:
@@ -113,15 +121,20 @@ def move_for(robot: Roomba, right_velocity: int, left_velocity: int, duration: f
     try:
         started = time.monotonic()
         robot.drive_direct(right_velocity, left_velocity)
-        requested_right = robot.read_packet(41, 2)
-        requested_left = robot.read_packet(42, 2)
-        if requested_right is None or requested_left is None:
-            print("No pude leer las velocidades solicitadas a las ruedas.")
-        else:
-            right = int.from_bytes(requested_right, byteorder="big", signed=True)
-            left = int.from_bytes(requested_left, byteorder="big", signed=True)
-            print(f"Velocidad solicitada al OI (derecha, izquierda): {right}, {left} mm/s")
-        time.sleep(max(0.0, duration - (time.monotonic() - started)))
+        print(
+            "Velocidad solicitada al OI (derecha, izquierda): "
+            f"{right_velocity}, {left_velocity} mm/s",
+        )
+        while time.monotonic() - started < duration:
+            blocked = robot.read_safety_sensors()
+            if blocked is None:
+                print(f"Movimiento detenido: no responden los sensores (paquete {robot.last_failed_packet}).")
+                return
+            if blocked:
+                print("Movimiento detenido por seguridad:", ", ".join(blocked))
+                return
+            remaining = duration - (time.monotonic() - started)
+            time.sleep(min(0.1, max(0.0, remaining)))
     finally:
         robot.stop()
 

@@ -46,7 +46,7 @@ Los movimientos duran entre 0,1 y 10 segundos y se detienen al terminar ese inte
 
 ## Mapa, odometría y rutas
 
-Ejecuta `py odometria.py`. En la ventana del mapa, las flechas teleoperan el Roomba; espacio o `x` paran; `r` reinicia las coordenadas; `i` muestra los acumulados de odometría; `q` cierra la ventana.
+Ejecuta `py odometria.py`. En la ventana del mapa, las flechas teleoperan el Roomba; espacio o `x` paran; `r` reinicia las coordenadas; `i` muestra los acumulados de odometría; `q` cierra la ventana. El indicador de sensores muestra si están despejados o qué condición de seguridad detectaron.
 
 En el cuadro **Ruta**, escribe tramos separados por comas y pulsa **Ejecutar**. Por ejemplo:
 
@@ -58,11 +58,11 @@ F100,R90,F150
 - `L90`: girar 90° a la izquierda; `R90`: girar 90° a la derecha.
 - Cada tramo recto está limitado a 500 cm y cada giro a 360°.
 - **Volver** invierte el orden y sentido de los tramos recorridos. El regreso es aproximado porque la odometría acumula error por deslizamiento y diferencias entre ruedas.
-- **Parar** o la barra espaciadora detienen el movimiento. La ruta también se detiene al detectar contacto con el parachoques o una condición de seguridad.
+- **Parar** o la barra espaciadora detienen el movimiento. Tanto el control manual como las rutas se detienen al detectar contacto con el parachoques, una condición de seguridad o pérdida de comunicación con los sensores. El control por terminal también supervisa los sensores durante cada movimiento.
 
 ## Límites de detección
 
-Los sensores originales del Roomba 650 no miden la distancia frontal a los obstáculos. El parachoques detecta contacto; por ello, la ruta puede detenerse al tocar un obstáculo, pero no garantiza evitar ese primer contacto ni detectar objetos a 10 cm.
+Los sensores originales del Roomba 650 no miden la distancia frontal a los obstáculos. El parachoques detecta el contacto; por ello, el robot se detiene al tocar un obstáculo, pero no puede evitar ese primer contacto ni detectar objetos a 10 cm sin añadir un sensor de distancia.
 
 ## Archivos
 
